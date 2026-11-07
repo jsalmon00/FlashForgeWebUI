@@ -68,6 +68,71 @@ export function registerJobUploadRoutes(router: Router, deps: RouteDependencies)
     await discardStagedUpload(validation.data.uploadId);
     return res.json({ success: true } satisfies StandardAPIResponse);
   });
+
+  // Backward compatibility direct upload endpoint for mobile companion app & external tools
+  router.post(
+    '/jobs/upload',
+    express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES }),
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const contextResult = resolveContext(req, deps, { requireBackendReady: true });
+        if (!contextResult.success) {
+          return sendErrorResponse<StandardAPIResponse>(
+            res,
+            contextResult.statusCode,
+            contextResult.error
+          );
+        }
+
+        const filenameParam = req.query.filename || req.headers['x-filename'];
+        const fileName = typeof filenameParam === 'string' ? filenameParam : 'upload.gcode';
+        const autoLevel = req.query.autoLevel === 'true';
+        const startNow = req.query.startNow !== 'false';
+
+        const buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+        if (!buffer || buffer.length === 0) {
+          return sendErrorResponse<StandardAPIResponse>(res, 400, 'Empty file body');
+        }
+
+        const staged = await stageUpload(fileName, buffer);
+        try {
+          const hasMaterialStation = deps.backendManager.isFeatureAvailable(
+            contextResult.contextId,
+            'material-station'
+          );
+          const is3MF = staged.fileName.toLowerCase().endsWith('.3mf');
+
+          const result =
+            hasMaterialStation && is3MF
+              ? await deps.backendManager.uploadFileAD5X(
+                  contextResult.contextId,
+                  staged.filePath,
+                  startNow,
+                  autoLevel
+                )
+              : await deps.backendManager.startJob(contextResult.contextId, {
+                  operation: 'start',
+                  filePath: staged.filePath,
+                  fileName: staged.fileName,
+                  leveling: autoLevel,
+                  startNow,
+                });
+
+          const response: StandardAPIResponse = {
+            success: result.success,
+            message: result.success ? `File uploaded: ${staged.fileName}` : undefined,
+            error: result.error,
+          };
+          return res.status(result.success ? 200 : 500).json(response);
+        } finally {
+          await discardStagedUpload(staged.id);
+        }
+      } catch (error) {
+        const appError = toAppError(error);
+        return sendErrorResponse<StandardAPIResponse>(res, 500, appError.message);
+      }
+    }
+  );
 }
 
 /**

@@ -6,6 +6,7 @@
  * provides unified WebRTC/MSE/MJPEG fallback for browser playback.
  */
 
+import http from 'http';
 import type { Response, Router } from 'express';
 import { resolveAndEnsureCameraStream } from '../../../services/CameraStreamCoordinator';
 import { getGo2rtcService } from '../../../services/Go2rtcService';
@@ -112,6 +113,8 @@ export function registerCameraRoutes(router: Router, deps: RouteDependencies): v
         streamType: cameraConfig.streamType,
         sourceType: cameraConfig.sourceType,
         streamName: streamConfig.streamName,
+        apiPort: 3000,
+        mjpegUrl: `/api/camera/stream.mjpeg?src=${encodeURIComponent(streamConfig.streamName)}`,
         mode: streamConfig.mode,
         showCameraFps: false,
       });
@@ -120,4 +123,33 @@ export function registerCameraRoutes(router: Router, deps: RouteDependencies): v
       return sendErrorResponse<StandardAPIResponse>(res, 500, appError.message);
     }
   });
+
+  const handleMjpegProxy = (req: AuthenticatedRequest, res: Response) => {
+    const src = req.query.src as string;
+    if (!src) {
+      return res.status(400).send('Missing src query parameter');
+    }
+
+    const targetUrl = `http://127.0.0.1:1984/api/stream.mjpeg?src=${encodeURIComponent(src)}`;
+    const proxyReq = http.request(targetUrl, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+
+    proxyReq.on('error', (err) => {
+      if (!res.headersSent) {
+        res.status(502).send(`Camera stream proxy error: ${err.message}`);
+      }
+    });
+
+    req.on('close', () => {
+      proxyReq.destroy();
+    });
+
+    proxyReq.end();
+  };
+
+  // Support both /api/stream.mjpeg and /api/camera/stream.mjpeg
+  router.get('/camera/stream.mjpeg', handleMjpegProxy);
+  router.get('/stream.mjpeg', handleMjpegProxy);
 }
