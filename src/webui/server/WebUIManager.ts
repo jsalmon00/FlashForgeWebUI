@@ -25,8 +25,13 @@ import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import { getConfigManager } from '../../managers/ConfigManager';
+import { getPrinterBackendManager } from '../../managers/PrinterBackendManager';
+import { getPrinterContextManager } from '../../managers/PrinterContextManager';
+import { resolveAndEnsureCameraStream } from '../../services/CameraStreamCoordinator';
 import { getEnvironmentService } from '../../services/EnvironmentService';
+import { getGo2rtcService } from '../../services/Go2rtcService';
 import type { PollingData } from '../../types/polling';
+import { getCameraUserConfig } from '../../utils/camera-utils';
 import { AppError, ErrorCode } from '../../utils/error.utils';
 import { WebUILoginRequestSchema } from '../schemas/web-api.schemas';
 import type { StandardAPIResponse, WebUILoginResponse } from '../types/web-api.types';
@@ -40,6 +45,7 @@ import {
   createRequestLogger,
 } from './auth-middleware';
 import { registerPublicThemeRoutes } from './routes/theme-routes';
+import { proxyGo2rtcHttp } from './routes/camera-routes';
 import { disposeUploadStaging } from './upload-staging';
 import { getWebSocketManager } from './WebSocketManager';
 
@@ -153,6 +159,9 @@ export class WebUIManager extends EventEmitter {
     // JSON body parsing
     this.expressApp.use(express.json());
 
+    // Intercept camera stream/snapshot queries before static middleware serves index.html
+    this.setupCameraMultiplexerRoutes();
+
     // Static file serving - use EnvironmentService for correct path resolution
     const environmentService = getEnvironmentService();
     const webUIStaticPath = environmentService.getWebUIStaticPath();
@@ -205,6 +214,80 @@ export class WebUIManager extends EventEmitter {
         error instanceof Error ? error : undefined
       );
     }
+  }
+
+  /**
+   * Expose mjpg-streamer compatible camera stream/snapshot routes on the WebUI
+   * port so multiple local consumers (such as SimplyPrint) can share go2rtc's
+   * single connection to the printer camera.
+   */
+  private setupCameraMultiplexerRoutes(): void {
+    if (!this.expressApp) return;
+
+    this.expressApp.get('/', (req, res, next) => {
+      const action = typeof req.query.action === 'string' ? req.query.action : undefined;
+      if (action !== 'stream' && action !== 'snapshot') {
+        next();
+        return;
+      }
+
+      const endpoint = action === 'snapshot' ? 'frame.jpeg' : 'stream.mjpeg';
+      void this.proxyGo2rtcCamera(req, res, endpoint);
+    });
+
+    this.expressApp.get('/api/camera/snapshot', (req, res) => {
+      void this.proxyGo2rtcCamera(req, res, 'frame.jpeg');
+    });
+  }
+
+  /**
+   * Proxy an MJPEG stream or single JPEG snapshot from the local go2rtc API.
+   */
+  private async proxyGo2rtcCamera(
+    req: express.Request,
+    res: express.Response,
+    endpoint: 'stream.mjpeg' | 'frame.jpeg'
+  ): Promise<void> {
+    const go2rtc = getGo2rtcService();
+    const activeContexts = go2rtc.getActiveContexts();
+    const streamConfig = activeContexts.length > 0 ? go2rtc.getStreamConfig(activeContexts[0]) : null;
+    const requestedSrc = typeof req.query.src === 'string' && req.query.src ? req.query.src : undefined;
+    let streamName = requestedSrc || streamConfig?.streamName;
+
+    if (!streamName) {
+      try {
+        const contextManager = getPrinterContextManager();
+        const contextId = contextManager.getActiveContextId();
+        const context = contextId ? contextManager.getContext(contextId) : undefined;
+        const backend = contextId
+          ? getPrinterBackendManager().getBackendForContext(contextId)
+          : undefined;
+        if (contextId && context && backend) {
+          const ensured = await resolveAndEnsureCameraStream({
+            contextId,
+            printerIpAddress: context.printerDetails.IPAddress,
+            printerFeatures: backend.getBackendStatus().features,
+            userConfig: getCameraUserConfig(contextId),
+            go2rtcService: go2rtc,
+          });
+          streamName = ensured?.streamConfig.streamName;
+        }
+      } catch (error) {
+        console.warn('[WebUI] Failed to ensure camera stream on demand:', error);
+      }
+    }
+
+    if (res.writableEnded || res.destroyed) {
+      return;
+    }
+
+    if (!streamName) {
+      res.status(503).send('Camera stream not active');
+      return;
+    }
+
+    const targetUrl = `http://127.0.0.1:${go2rtc.getApiPort()}/api/${endpoint}?src=${encodeURIComponent(streamName)}`;
+    proxyGo2rtcHttp(req, res, targetUrl);
   }
 
   /**

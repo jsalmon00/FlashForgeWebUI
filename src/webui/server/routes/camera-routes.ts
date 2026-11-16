@@ -7,7 +7,7 @@
  */
 
 import http from 'http';
-import type { Response, Router } from 'express';
+import type { Request, Response, Router } from 'express';
 import { resolveAndEnsureCameraStream } from '../../../services/CameraStreamCoordinator';
 import { getGo2rtcService } from '../../../services/Go2rtcService';
 import { getCameraUserConfig, resolveCameraConfig } from '../../../utils/camera-utils';
@@ -124,32 +124,43 @@ export function registerCameraRoutes(router: Router, deps: RouteDependencies): v
     }
   });
 
-  const handleMjpegProxy = (req: AuthenticatedRequest, res: Response) => {
-    const src = req.query.src as string;
+  const handleMjpegProxy = (req: AuthenticatedRequest, res: Response): void => {
+    const src = typeof req.query.src === 'string' ? req.query.src : '';
     if (!src) {
-      return res.status(400).send('Missing src query parameter');
+      res.status(400).send('Missing src query parameter');
+      return;
     }
 
-    const targetUrl = `http://127.0.0.1:1984/api/stream.mjpeg?src=${encodeURIComponent(src)}`;
-    const proxyReq = http.request(targetUrl, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
-      proxyRes.pipe(res);
-    });
-
-    proxyReq.on('error', (err) => {
-      if (!res.headersSent) {
-        res.status(502).send(`Camera stream proxy error: ${err.message}`);
-      }
-    });
-
-    req.on('close', () => {
-      proxyReq.destroy();
-    });
-
-    proxyReq.end();
+    const apiPort = getGo2rtcService().getApiPort();
+    const targetUrl = `http://127.0.0.1:${apiPort}/api/stream.mjpeg?src=${encodeURIComponent(src)}`;
+    proxyGo2rtcHttp(req, res, targetUrl);
   };
 
   // Support both /api/stream.mjpeg and /api/camera/stream.mjpeg
   router.get('/camera/stream.mjpeg', handleMjpegProxy);
   router.get('/stream.mjpeg', handleMjpegProxy);
+}
+
+/**
+ * Proxy an HTTP stream or snapshot request to the local go2rtc API.
+ */
+export function proxyGo2rtcHttp(req: Request, res: Response, targetUrl: string): void {
+  const proxyReq = http.request(targetUrl, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on('error', (err) => {
+    if (!res.headersSent) {
+      res.status(502).send(`Camera stream proxy error: ${err.message}`);
+    } else {
+      res.end();
+    }
+  });
+
+  req.on('close', () => {
+    proxyReq.destroy();
+  });
+
+  proxyReq.end();
 }

@@ -564,14 +564,21 @@ async function main(): Promise<void> {
 
     connectionManager.on(
       'feature-updated',
-      (event: { contextId?: string; changedKeys?: readonly string[] }) => {
+      (event: {
+        contextId?: string;
+        changedKeys?: readonly string[];
+        data?: { changedKeys?: readonly string[] };
+      }) => {
         const contextId = event.contextId;
         if (!contextId) {
           return;
         }
 
-        const changedKeys = event.changedKeys || [];
-        if (!changedKeys.includes('oemCameraStreamUrl')) {
+        const changedKeys = event.data?.changedKeys ?? event.changedKeys ?? [];
+        if (
+          !changedKeys.includes('oemCameraStreamUrl') &&
+          !changedKeys.includes('fallbackCameraStreamUrl')
+        ) {
           return;
         }
 
