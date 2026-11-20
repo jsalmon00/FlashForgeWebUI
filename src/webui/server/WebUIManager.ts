@@ -45,6 +45,7 @@ import {
   createRequestLogger,
 } from './auth-middleware';
 import { registerPublicThemeRoutes } from './routes/theme-routes';
+import { registerMoonrakerShimRoutes } from './routes/moonraker-shim-routes';
 import { proxyGo2rtcHttp } from './routes/camera-routes';
 import { disposeUploadStaging } from './upload-staging';
 import { getWebSocketManager } from './WebSocketManager';
@@ -303,6 +304,9 @@ export class WebUIManager extends EventEmitter {
 
     // Public routes that should be available without authentication (e.g., theme defaults)
     registerPublicThemeRoutes(this.expressApp, routeDependencies);
+
+    // Moonraker HTTP compatibility shim (consumed by PrintGuard Klipper adapter)
+    registerMoonrakerShimRoutes(this.expressApp, routeDependencies);
 
     // Protected API routes (WebUI auth required).
     // Auth is applied PER-ROUTE inside createAPIRoutes (not as a blanket /api
