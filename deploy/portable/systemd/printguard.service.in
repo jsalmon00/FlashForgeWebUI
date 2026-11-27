@@ -1,0 +1,24 @@
+[Unit]
+Description=PrintGuard 3D Print Failure Detection Hub
+After=network-online.target flashforgeui.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__STACK_USER__
+Group=__STACK_GROUP__
+WorkingDirectory=/opt/printguard
+Environment="PORT=8001"
+Environment="DATA_DIR=/var/lib/printguard"
+Environment="MODEL_DIR=/opt/printguard/models"
+Environment="STATIC_DIR=/opt/printguard/static"
+Environment="MEDIAMTX_BINARY=/opt/printguard/bin/mediamtx"
+Environment="MEDIAMTX_CONFIG=/opt/printguard/mediamtx.yml"
+Environment="MEDIAMTX_RTSP=rtsp://localhost:8556"
+ExecStart=/opt/printguard/.venv/bin/python -m printguard.server.app
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

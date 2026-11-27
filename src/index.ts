@@ -22,6 +22,7 @@ import { getPrinterContextManager } from './managers/PrinterContextManager';
 import { resolveAndEnsureCameraStream } from './services/CameraStreamCoordinator';
 import { getDiscordNotificationService } from './services/discord';
 import { getGo2rtcService } from './services/Go2rtcService';
+import { getHeadlessAutoRecoveryService } from './services/HeadlessAutoRecoveryService';
 import { getMultiContextPollingCoordinator } from './services/MultiContextPollingCoordinator';
 import { getMultiContextPrintStateMonitor } from './services/MultiContextPrintStateMonitor';
 import { getMultiContextSpoolmanTracker } from './services/MultiContextSpoolmanTracker';
@@ -359,6 +360,7 @@ async function shutdown(): Promise<void> {
 
   const startTime = Date.now();
   console.log('[Shutdown] Starting graceful shutdown...');
+  getHeadlessAutoRecoveryService().stop();
 
   // Set hard deadline - ultimate fallback to prevent indefinite hangs
   const hardDeadline = createHardDeadline(SHUTDOWN_CONFIG.HARD_DEADLINE_MS);
@@ -374,11 +376,12 @@ async function shutdown(): Promise<void> {
     discordService.dispose();
     console.log('[Shutdown] Discord notifications stopped');
 
-    // Step 3: Parallel disconnects (all printers disconnect concurrently)
-    console.log(`[Shutdown] Step 3/5: Disconnecting ${connectedContexts.length} context(s)...`);
-    if (connectedContexts.length > 0) {
+    // Step 3: Parallel disconnects (all active contexts disconnect concurrently)
+    const activeIds = contextManager.getAllContexts().map((c) => c.id);
+    console.log(`[Shutdown] Step 3/5: Disconnecting ${activeIds.length} context(s)...`);
+    if (activeIds.length > 0) {
       const results = await Promise.allSettled(
-        connectedContexts.map((contextId) => connectionManager.disconnectContext(contextId))
+        activeIds.map((contextId) => connectionManager.disconnectContext(contextId))
       );
 
       const succeeded = results.filter((result) => result.status === 'fulfilled').length;
@@ -388,7 +391,7 @@ async function shutdown(): Promise<void> {
 
       results.forEach((result, index) => {
         if (result.status === 'rejected') {
-          console.warn(`[Shutdown] Context ${connectedContexts[index]} failed:`, result.reason);
+          console.warn(`[Shutdown] Context ${activeIds[index]} failed:`, result.reason);
         }
       });
     } else {
@@ -593,6 +596,7 @@ async function main(): Promise<void> {
     console.log('[Events] Pre-disconnect hook configured');
 
     contextManager.on('context-removed', (event: { contextId: string }) => {
+      getMultiContextPrintStateMonitor().destroyMonitor(event.contextId);
       void go2rtcService.removeStream(event.contextId);
     });
     console.log('[Events] Context-removed hook configured');
@@ -629,6 +633,9 @@ async function main(): Promise<void> {
     if (connectedContexts.length > 0) {
       await reconcileConnectedCameraStreams();
     }
+
+    // 14b. Start headless auto-recovery monitor for IP changes & boot-order races
+    getHeadlessAutoRecoveryService().start(config.mode);
 
     // 15. Setup signal handlers
     setupSignalHandlers();

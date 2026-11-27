@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch FlashForgeWebUI printer_details.json for IP changes
+
+[Path]
+PathChanged=__DATA_DIR__/printer_details.json
+PathModified=__DATA_DIR__/printer_details.json
+
+[Install]
+WantedBy=multi-user.target

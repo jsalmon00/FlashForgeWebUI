@@ -124,9 +124,11 @@ describe('camera-routes', () => {
     expect(body).toEqual({
       success: true,
       wsUrl: '/api/camera/ws?src=context-1-camera',
+      mjpegUrl: '/api/camera/stream.mjpeg?src=context-1-camera',
       streamType: 'mjpeg',
       sourceType: 'oem',
       streamName: 'context-1-camera',
+      apiPort: 3000,
       mode: 'webrtc,mse,mjpeg',
       showCameraFps: false,
     });
@@ -233,9 +235,11 @@ describe('camera-routes', () => {
     expect(body).toEqual({
       success: true,
       wsUrl: '/api/camera/ws?src=context-1-camera',
+      mjpegUrl: '/api/camera/stream.mjpeg?src=context-1-camera',
       streamType: 'mjpeg',
       sourceType: 'intelligent-fallback',
       streamName: 'context-1-camera',
+      apiPort: 3000,
       mode: 'webrtc,mse,mjpeg',
       showCameraFps: false,
     });

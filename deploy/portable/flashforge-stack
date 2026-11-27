@@ -1,0 +1,992 @@
+#!/usr/bin/env python3
+"""Portable management, auto-sync, discovery, and migration CLI for the FlashForge stack."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import fcntl
+import getpass
+import grp
+import ipaddress
+import json
+import os
+import pwd
+import re
+import shlex
+import shutil
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+MULTICAST_ADDR = "225.0.0.9"
+DISCOVERY_PORTS = (8899, 19000, 48899)
+MODERN_PACKET_LEN = 276
+LEGACY_PACKET_LEN = 140
+LOCK_FILE = "/run/flashforge-stack.lock"
+
+PRODUCT_MODELS = {
+    0x0023: "Adventurer 5M",
+    0x0024: "Adventurer 5M Pro",
+    0x0026: "AD5X",
+    0x0028: "Creator 5",
+    0x0029: "Creator 5 Pro",
+}
+
+IGNORED_IFACE_RE = re.compile(r"^(lo|tailscale|docker|virbr|br-|veth|tun|tap)", re.IGNORECASE)
+
+
+def resolve_stack_identity() -> dict[str, Any]:
+    """Resolve user, group, home, and config/service paths from env or existing state."""
+    explicit_data_dir = os.environ.get("DATA_DIR")
+    explicit_user = os.environ.get("STACK_USER")
+
+    candidate_user = explicit_user
+    if not candidate_user and explicit_data_dir and os.path.exists(explicit_data_dir):
+        st = os.stat(explicit_data_dir)
+        owner = pwd.getpwuid(st.st_uid).pw_name
+        if owner != "root":
+            candidate_user = owner
+    if not candidate_user:
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user and sudo_user != "root":
+            candidate_user = sudo_user
+    if not candidate_user:
+        if os.path.exists("/home/jo/.config/FlashForgeUI"):
+            owner = pwd.getpwuid(os.stat("/home/jo/.config/FlashForgeUI").st_uid).pw_name
+            if owner != "root":
+                candidate_user = owner
+    if not candidate_user:
+        try:
+            pwd.getpwnam("jo")
+            candidate_user = "jo"
+        except KeyError:
+            candidate_user = getpass.getuser()
+
+    try:
+        pw = pwd.getpwnam(candidate_user)
+    except KeyError:
+        pw = pwd.getpwuid(os.getuid())
+
+    group_name = grp.getgrgid(pw.pw_gid).gr_name
+    home_dir = pw.pw_dir
+    data_dir = explicit_data_dir or os.path.join(home_dir, ".config", "FlashForgeUI")
+
+    return {
+        "user": pw.pw_name,
+        "uid": pw.pw_uid,
+        "gid": pw.pw_gid,
+        "group": group_name,
+        "home": home_dir,
+        "data_dir": data_dir,
+        "printguard_data_dir": os.environ.get("PRINTGUARD_DATA_DIR", "/var/lib/printguard"),
+        "simplyprint_db": os.environ.get(
+            "SIMPLYPRINT_DB", "/root/.local/share/SimplyPrint/state.db"
+        ),
+        "webui_port": int(os.environ.get("WEBUI_PORT", "3000")),
+        "simplyprint_port": int(os.environ.get("SIMPLYPRINT_PORT", "8000")),
+        "printguard_port": int(os.environ.get("PRINTGUARD_PORT", "8001")),
+    }
+
+
+def get_ipv4_interfaces() -> list[dict[str, str]]:
+    """Return active IPv4 interfaces with interface name, IP, CIDR prefixlen, and broadcast."""
+    try:
+        out = subprocess.check_output(["ip", "-o", "-4", "addr", "show"], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+
+    results: list[dict[str, str]] = []
+    for raw_line in out.splitlines():
+        parts = raw_line.split()
+        if len(parts) < 4:
+            continue
+        iface = parts[1]
+        try:
+            inet_idx = parts.index("inet")
+        except ValueError:
+            continue
+        cidr = parts[inet_idx + 1]
+        brd = ""
+        if "brd" in parts:
+            brd_idx = parts.index("brd")
+            if brd_idx + 1 < len(parts):
+                brd = parts[brd_idx + 1]
+        try:
+            net = ipaddress.IPv4Interface(cidr)
+        except ValueError:
+            continue
+        results.append(
+            {
+                "iface": iface,
+                "ip": str(net.ip),
+                "network": str(net.network),
+                "prefixlen": str(net.network.prefixlen),
+                "broadcast": brd or str(net.network.broadcast_address),
+            }
+        )
+    return results
+
+
+def parse_udp_discovery_packet(data: bytes, source_ip: str) -> dict[str, Any] | None:
+    """Parse modern (276-byte) or legacy (140-byte) FlashForge UDP discovery responses."""
+    if len(data) >= MODERN_PACKET_LEN:
+        name = data[0x00:0x84].split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
+        cmd_port, vid, pid, status_code, _prod_type, event_port = struct.unpack(
+            ">HHHHHH", data[0x84:0x90]
+        )
+        serial = data[0x92:0x112].split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
+        return {
+            "name": name or serial or source_ip,
+            "model": PRODUCT_MODELS.get(pid, "Unknown"),
+            "protocol": "modern",
+            "ipAddress": source_ip,
+            "serialNumber": serial,
+            "commandPort": cmd_port or 8899,
+            "eventPort": event_port or 8898,
+            "productId": pid,
+            "vendorId": vid,
+            "statusCode": status_code,
+            "source": "udp",
+        }
+    if len(data) >= LEGACY_PACKET_LEN:
+        name = data[0x00:0x80].split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
+        cmd_port, vid, pid, status_code = struct.unpack(">HHHH", data[0x84:0x8C])
+        return {
+            "name": name or source_ip,
+            "model": "Legacy",
+            "protocol": "legacy",
+            "ipAddress": source_ip,
+            "serialNumber": "",
+            "commandPort": cmd_port or 8899,
+            "eventPort": None,
+            "productId": pid,
+            "vendorId": vid,
+            "statusCode": status_code,
+            "source": "udp",
+        }
+    return None
+
+
+def udp_discover(timeout: float = 2.5, idle_timeout: float = 1.0) -> list[dict[str, Any]]:
+    """Broadcast and multicast FlashForge UDP discovery probes on local LAN."""
+    ifaces = [
+        item
+        for item in get_ipv4_interfaces()
+        if not IGNORED_IFACE_RE.match(item["iface"])
+        and not ipaddress.IPv4Address(item["ip"]).is_loopback
+    ]
+    broadcasts = sorted({item["broadcast"] for item in ifaces if item.get("broadcast")})
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.bind(("0.0.0.0", 0))
+
+    for item in ifaces:
+        try:
+            mreq = socket.inet_aton(MULTICAST_ADDR) + socket.inet_aton(item["ip"])
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except OSError:
+            pass
+
+    discovered: dict[str, dict[str, Any]] = {}
+    try:
+        for _attempt in range(2):
+            for port in (8899, 19000):
+                try:
+                    sock.sendto(b"", (MULTICAST_ADDR, port))
+                except OSError:
+                    pass
+            for bcast in broadcasts:
+                try:
+                    sock.sendto(b"", (bcast, 48899))
+                except OSError:
+                    pass
+            for port in DISCOVERY_PORTS:
+                try:
+                    sock.sendto(b"", ("255.255.255.255", port))
+                except OSError:
+                    pass
+
+            deadline = time.monotonic() + timeout
+            last_packet = None
+            while True:
+                now = time.monotonic()
+                remaining = deadline - now
+                if last_packet is not None:
+                    remaining = min(remaining, (last_packet + idle_timeout) - now)
+                if remaining <= 0:
+                    break
+                sock.settimeout(remaining)
+                try:
+                    payload, (addr, _rport) = sock.recvfrom(2048)
+                except socket.timeout:
+                    break
+                parsed = parse_udp_discovery_packet(payload, addr)
+                if parsed:
+                    last_packet = time.monotonic()
+                    key = f"{parsed['ipAddress']}:{parsed['commandPort']}"
+                    discovered[key] = parsed
+
+            if discovered:
+                break
+    finally:
+        sock.close()
+
+    return list(discovered.values())
+
+
+def probe_http_detail(
+    ip: str, port: int = 8898, serial: str = "", check_code: str = "", timeout: float = 1.5
+) -> dict[str, Any] | None:
+    """Query POST /detail on a printer HTTP port."""
+    url = f"http://{ip}:{port}/detail"
+    body = json.dumps({"serialNumber": serial, "checkCode": check_code}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            parsed = json.loads(resp.read().decode("utf-8", "replace"))
+            return parsed if isinstance(parsed, dict) else None
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+
+
+def _check_tcp_8898(ip: str, timeout: float = 0.5) -> str | None:
+    try:
+        with socket.create_connection((ip, 8898), timeout=timeout):
+            return ip
+    except OSError:
+        return None
+
+
+def tcp_fallback_discover(saved_printer: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Probe local /24 subnets on port 8898 and confirm FlashForge printers via /detail."""
+    targets: list[str] = []
+    for item in get_ipv4_interfaces():
+        if IGNORED_IFACE_RE.match(item["iface"]) or item["prefixlen"] != "24":
+            continue
+        addr_obj = ipaddress.IPv4Address(item["ip"])
+        if addr_obj.is_loopback or addr_obj in ipaddress.IPv4Network("100.64.0.0/10"):
+            continue
+        prefix = ".".join(item["ip"].split(".")[:3])
+        for host in range(1, 255):
+            candidate = f"{prefix}.{host}"
+            if candidate != item["ip"]:
+                targets.append(candidate)
+
+    if not targets:
+        return []
+
+    open_ips: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
+        for res in pool.map(_check_tcp_8898, targets):
+            if res:
+                open_ips.append(res)
+
+    serial = (saved_printer or {}).get("SerialNumber", "")
+    check_code = (saved_printer or {}).get("CheckCode", "")
+    found: list[dict[str, Any]] = []
+    for ip in open_ips:
+        reply = probe_http_detail(ip, 8898, serial=serial, check_code=check_code, timeout=2.0)
+        if reply is None or "code" not in reply:
+            continue
+        detail = reply.get("detail") if isinstance(reply.get("detail"), dict) else {}
+        det_serial = str(detail.get("name") or serial or "")
+        pid = detail.get("pid")
+        found.append(
+            {
+                "name": det_serial or ip,
+                "model": PRODUCT_MODELS.get(pid, "Unknown") if isinstance(pid, int) else "Unknown",
+                "protocol": "modern",
+                "ipAddress": ip,
+                "serialNumber": det_serial,
+                "commandPort": 8899,
+                "eventPort": 8898,
+                "productId": pid if isinstance(pid, int) else None,
+                "statusCode": reply.get("code"),
+                "source": "tcp-http",
+            }
+        )
+    return found
+
+
+def load_printer_details(data_dir: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Load printer_details.json and return (full_doc, active_printer_dict)."""
+    path = Path(data_dir) / "printer_details.json"
+    if not path.is_file():
+        return {"lastUsedPrinterSerial": None, "printers": {}}, None
+    with path.open("r", encoding="utf-8") as fh:
+        doc = json.load(fh)
+    printers = doc.get("printers") or {}
+    last_serial = doc.get("lastUsedPrinterSerial")
+    active = printers.get(last_serial) if last_serial else None
+    if active is None and len(printers) == 1:
+        active = next(iter(printers.values()))
+    return doc, active
+
+
+def save_printer_details_atomic(data_dir: str, doc: dict[str, Any], uid: int, gid: int) -> None:
+    """Atomically write printer_details.json with preserved user ownership."""
+    os.makedirs(data_dir, exist_ok=True)
+    os.chown(data_dir, uid, gid)
+    target = Path(data_dir) / "printer_details.json"
+    fd, tmp_path = tempfile.mkstemp(prefix=".printer_details.", suffix=".json", dir=data_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2)
+            fh.write("\n")
+        os.chmod(tmp_path, 0o664)
+        os.chown(tmp_path, uid, gid)
+        os.replace(tmp_path, target)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def sync_iptables_nat(printer_ip: str, stack_uid: int, webui_port: int) -> str:
+    """Ensure iptables NAT OUTPUT redirects non-stack-user port 8080 traffic for printer_ip."""
+    if not printer_ip:
+        return "skipped (no printer IP in printer_details.json)"
+
+    existing = subprocess.check_output(["iptables", "-t", "nat", "-S", "OUTPUT"], text=True)
+    desired_rule = (
+        f"-A OUTPUT -d {printer_ip}/32 -p tcp -m tcp --dport 8080 "
+        f"-m owner ! --uid-owner {stack_uid} -j REDIRECT --to-ports {webui_port}"
+    )
+
+    kept_exact = False
+    removed = 0
+    for raw_line in existing.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("-A OUTPUT "):
+            continue
+        is_ff_cam_rule = (
+            "--dport 8080" in line
+            and "--uid-owner" in line
+            and (
+                ("-j REDIRECT" in line and f"--to-ports {webui_port}" in line)
+                or ("-j DNAT" in line and f":{webui_port}" in line)
+            )
+        )
+        if not is_ff_cam_rule:
+            continue
+
+        if line == desired_rule and not kept_exact:
+            kept_exact = True
+            continue
+
+        tokens = shlex.split(line)
+        tokens[0] = "-D"
+        subprocess.run(["iptables", "-t", "nat", *tokens], check=True)
+        removed += 1
+
+    added = False
+    if not kept_exact:
+        subprocess.run(
+            [
+                "iptables",
+                "-t",
+                "nat",
+                "-A",
+                "OUTPUT",
+                "-d",
+                f"{printer_ip}/32",
+                "-p",
+                "tcp",
+                "-m",
+                "tcp",
+                "--dport",
+                "8080",
+                "-m",
+                "owner",
+                "!",
+                "--uid-owner",
+                str(stack_uid),
+                "-j",
+                "REDIRECT",
+                "--to-ports",
+                str(webui_port),
+            ],
+            check=True,
+        )
+        added = True
+
+    if removed == 0 and not added:
+        return f"unchanged ({printer_ip}:8080 -> REDIRECT :{webui_port})"
+    return f"updated (removed={removed}, added={added}, target={printer_ip}:8080 -> REDIRECT :{webui_port})"
+
+
+def sync_simplyprint_db(
+    db_path: str, printer_ip: str, serial: str, check_code: str
+) -> str:
+    """Sync host and access_code inside SimplyPrint's state.db without losing pairing."""
+    if not os.path.isfile(db_path):
+        return f"skipped ({db_path} not found)"
+    if not printer_ip:
+        return "skipped (no printer IP)"
+
+    conn_ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = conn_ro.execute(
+            "SELECT unique_id, data, rev FROM printers WHERE store = 'FlashforgeClient'"
+        ).fetchall()
+    finally:
+        conn_ro.close()
+
+    if not rows:
+        return "skipped (no FlashforgeClient printer configured in SimplyPrint)"
+
+    target_row = None
+    for row in rows:
+        try:
+            payload = json.loads(row[1])
+        except ValueError:
+            continue
+        if serial and payload.get("serial") == serial:
+            target_row = (row[0], payload, row[2])
+            break
+    if target_row is None and len(rows) == 1:
+        payload = json.loads(rows[0][1])
+        target_row = (rows[0][0], payload, rows[0][2])
+    if target_row is None:
+        return f"skipped (no matching SimplyPrint row for serial {serial or 'unknown'})"
+
+    unique_id, data_obj, rev = target_row
+    current_host = data_obj.get("host")
+    current_code = data_obj.get("access_code")
+    needs_host = current_host != printer_ip
+    needs_code = bool(check_code) and current_code != check_code
+
+    if not needs_host and not needs_code:
+        return f"unchanged (host={current_host})"
+
+    was_active = (
+        subprocess.run(
+            ["systemctl", "is-active", "--quiet", "simplyprint-client.service"],
+            check=False,
+        ).returncode
+        == 0
+    )
+
+    if was_active:
+        subprocess.run(["systemctl", "stop", "simplyprint-client.service"], check=True)
+
+    try:
+        shutil.copy2(db_path, f"{db_path}.pre-sync.bak")
+        data_obj["host"] = printer_ip
+        if check_code:
+            data_obj["access_code"] = check_code
+        new_rev = (int(rev) + 1) if rev is not None else 1
+
+        conn_rw = sqlite3.connect(db_path, timeout=10.0)
+        try:
+            conn_rw.execute(
+                "UPDATE printers SET data = ?, rev = ? WHERE unique_id = ?",
+                (json.dumps(data_obj, separators=(",", ":")), new_rev, unique_id),
+            )
+            conn_rw.commit()
+        finally:
+            conn_rw.close()
+    finally:
+        if was_active:
+            subprocess.run(["systemctl", "start", "simplyprint-client.service"], check=True)
+
+    return f"updated ({current_host} -> {printer_ip}; simplyprint-client restarted={was_active})"
+
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    ident = resolve_stack_identity()
+    _doc, saved = load_printer_details(ident["data_dir"])
+    results = udp_discover()
+    if not results and args.tcp_fallback:
+        results = tcp_fallback_discover(saved)
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return 0
+
+    if not results:
+        print("No FlashForge printers found on the local network.")
+        return 1
+
+    print(f"Discovered {len(results)} FlashForge printer(s):")
+    for idx, p in enumerate(results, 1):
+        print(
+            f"  {idx}. {p['name']} | model={p['model']} | ip={p['ipAddress']} | "
+            f"serial={p['serialNumber'] or 'n/a'} | via={p['source']}"
+        )
+    return 0
+
+
+def _http_get_json(url: str, timeout: float = 3.0) -> tuple[int | None, Any]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read().decode("utf-8", "replace"))
+        except Exception:
+            return exc.code, None
+    except Exception:
+        return None, None
+
+
+def _http_get_head(url: str, timeout: float = 3.0) -> str:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return f"{resp.status} ({resp.headers.get('Content-Type', 'unknown')})"
+    except urllib.error.HTTPError as exc:
+        return f"HTTP {exc.code}"
+    except Exception as exc:
+        return f"error ({exc})"
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    ident = resolve_stack_identity()
+    _doc, saved = load_printer_details(ident["data_dir"])
+
+    ifaces = get_ipv4_interfaces()
+    lan_ips = [
+        item["ip"]
+        for item in ifaces
+        if not IGNORED_IFACE_RE.match(item["iface"])
+        and not ipaddress.IPv4Address(item["ip"]).is_loopback
+        and ipaddress.IPv4Address(item["ip"]) not in ipaddress.IPv4Network("100.64.0.0/10")
+    ]
+    ts_ips = [
+        item["ip"]
+        for item in ifaces
+        if item["iface"].startswith("tailscale")
+        or ipaddress.IPv4Address(item["ip"]) in ipaddress.IPv4Network("100.64.0.0/10")
+    ]
+
+    print(f"Host: {socket.gethostname()} | User: {ident['user']} (uid={ident['uid']})")
+    print(f"LAN IPv4: {', '.join(lan_ips) or 'none detected'}")
+    print(f"Tailscale IPv4: {', '.join(ts_ips) or 'not connected'}")
+    primary_ip = lan_ips[0] if lan_ips else "127.0.0.1"
+    print(
+        "Dashboards:\n"
+        f"  FlashForgeWebUI : http://{primary_ip}:{ident['webui_port']}\n"
+        f"  SimplyPrint UI  : http://{primary_ip}:{ident['simplyprint_port']}\n"
+        f"  PrintGuard AI   : http://{primary_ip}:{ident['printguard_port']}"
+    )
+
+    print("\nSaved Printer:")
+    if saved:
+        print(
+            f"  Name={saved.get('Name')} Serial={saved.get('SerialNumber')} "
+            f"IP={saved.get('IPAddress')} CheckCode={saved.get('CheckCode')}"
+        )
+    else:
+        print(f"  None configured in {ident['data_dir']}/printer_details.json")
+
+    print("\nSystemd Units:")
+    for unit in (
+        "flashforgeui.service",
+        "simplyprint-client.service",
+        "printguard.service",
+        "ff-printer-sync.path",
+    ):
+        state = subprocess.run(
+            ["systemctl", "is-active", unit], capture_output=True, text=True, check=False
+        ).stdout.strip() or "unknown"
+        print(f"  {unit:28s}: {state}")
+
+    print("\nLive Probes:")
+    if saved and saved.get("IPAddress"):
+        detail = probe_http_detail(
+            saved["IPAddress"],
+            int(saved.get("httpPort") or 8898),
+            serial=str(saved.get("SerialNumber") or ""),
+            check_code=str(saved.get("CheckCode") or ""),
+        )
+        if detail and detail.get("code") == 0:
+            st = (detail.get("detail") or {}).get("status", "unknown")
+            print(f"  Printer HTTP /detail        : OK (status={st})")
+        else:
+            print("  Printer HTTP /detail        : UNREACHABLE / ERROR")
+
+    w_code, w_body = _http_get_json(f"http://127.0.0.1:{ident['webui_port']}/api/printer/status")
+    if w_code == 200 and isinstance(w_body, dict) and w_body.get("success"):
+        st = (w_body.get("status") or {}).get("printerState", "unknown")
+        print(f"  WebUI /api/printer/status   : 200 OK (printerState={st})")
+    else:
+        print(f"  WebUI /api/printer/status   : HTTP {w_code or 'down'}")
+
+    snap = _http_get_head(f"http://127.0.0.1:{ident['webui_port']}/?action=snapshot")
+    print(f"  Camera multiplexer snapshot : {snap}")
+
+    pg_code, pg_body = _http_get_json(f"http://127.0.0.1:{ident['printguard_port']}/api/v1/state")
+    if pg_code == 200 and isinstance(pg_body, dict):
+        printers = pg_body.get("printers") or []
+        cameras = pg_body.get("cameras") or []
+        monitors = pg_body.get("monitors") or []
+        if printers:
+            p0 = printers[0]
+            base_url = (p0.get("config") or {}).get("base_url")
+            print(f"  PrintGuard printer          : online={p0.get('online')} base_url={base_url}")
+        if cameras:
+            c0 = cameras[0]
+            print(
+                f"  PrintGuard camera           : online={c0.get('online')} standby={c0.get('standby')}"
+            )
+        if monitors:
+            m0 = monitors[0]
+            print(
+                f"  PrintGuard monitor          : enabled={m0.get('enabled')} on_defect={m0.get('on_defect')}"
+            )
+    else:
+        print(f"  PrintGuard /api/v1/state    : HTTP {pg_code or 'down'}")
+
+    print("\nSync State:")
+    if os.geteuid() == 0:
+        if os.path.isfile(ident["simplyprint_db"]):
+            conn = sqlite3.connect(f"file:{ident['simplyprint_db']}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT data FROM printers WHERE store = 'FlashforgeClient'"
+                ).fetchall()
+            finally:
+                conn.close()
+            if rows:
+                sp_hosts = [json.loads(r[0]).get("host") for r in rows]
+                print(f"  SimplyPrint DB host(s)      : {', '.join(str(h) for h in sp_hosts)}")
+            else:
+                print("  SimplyPrint DB host(s)      : no FlashforgeClient row")
+        else:
+            print("  SimplyPrint DB              : not installed")
+
+        nat_out = subprocess.check_output(["iptables", "-t", "nat", "-S", "OUTPUT"], text=True)
+        cam_rules = [ln for ln in nat_out.splitlines() if "--dport 8080" in ln]
+        print(f"  iptables NAT OUTPUT (8080)  : {cam_rules[0] if cam_rules else 'none'}")
+    else:
+        print("  (Run with sudo to inspect SimplyPrint DB and iptables NAT rules)")
+
+    return 0
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    if os.geteuid() != 0:
+        print("Error: 'sync' must run as root (sudo flashforge-stack sync).", file=sys.stderr)
+        return 1
+
+    ident = resolve_stack_identity()
+    lock_fh = open(LOCK_FILE, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        _doc, saved = load_printer_details(ident["data_dir"])
+        if not saved:
+            print(f"No saved printer found in {ident['data_dir']}/printer_details.json")
+            return 0
+
+        printer_ip = str(saved.get("IPAddress") or "")
+        serial = str(saved.get("SerialNumber") or "")
+        check_code = str(saved.get("CheckCode") or "")
+
+        nat_status = sync_iptables_nat(printer_ip, ident["uid"], ident["webui_port"])
+        print(f"[sync] iptables NAT: {nat_status}")
+
+        if not args.iptables_only:
+            sp_status = sync_simplyprint_db(ident["simplyprint_db"], printer_ip, serial, check_code)
+            print(f"[sync] SimplyPrint DB: {sp_status}")
+    finally:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        lock_fh.close()
+    return 0
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    if os.geteuid() != 0:
+        print("Error: 'setup' must run as root (sudo flashforge-stack setup).", file=sys.stderr)
+        return 1
+
+    ident = resolve_stack_identity()
+    doc, saved = load_printer_details(ident["data_dir"])
+    discovered = udp_discover()
+    if not discovered:
+        discovered = tcp_fallback_discover(saved)
+
+    if discovered:
+        print("Discovered printer(s) on LAN:")
+        for idx, p in enumerate(discovered, 1):
+            print(
+                f"  {idx}. {p['name']} ({p['ipAddress']}, serial={p['serialNumber'] or 'n/a'}, via={p['source']})"
+            )
+    else:
+        print("No printers responded to automatic LAN discovery.")
+
+    saved_serial = (saved or {}).get("SerialNumber", "")
+    matched = next((d for d in discovered if saved_serial and d.get("serialNumber") == saved_serial), None)
+    if matched is None and len(discovered) == 1:
+        matched = discovered[0]
+
+    default_ip = args.printer_ip or (matched or {}).get("ipAddress") or (saved or {}).get("IPAddress") or ""
+    default_serial = args.serial or (matched or {}).get("serialNumber") or saved_serial or ""
+    default_code = args.check_code or (saved or {}).get("CheckCode") or ""
+
+    if args.yes:
+        printer_ip = default_ip
+        serial = default_serial
+        check_code = default_code
+    else:
+        print(
+            "\nNote: If you changed routers or reset LAN-only mode on the printer touchscreen,\n"
+            "check Settings -> Network -> LAN Only on the printer for its Access Code / CheckCode."
+        )
+        printer_ip = input(f"Printer IP address [{default_ip}]: ").strip() or default_ip
+        serial = input(f"Printer Serial Number [{default_serial}]: ").strip() or default_serial
+        check_code = input(f"LAN Access Code / CheckCode [{default_code}]: ").strip() or default_code
+
+    if not printer_ip or not serial or not check_code:
+        print("Error: printer IP, serial number, and check code are required.", file=sys.stderr)
+        return 1
+
+    if not args.force:
+        reply = probe_http_detail(printer_ip, 8898, serial=serial, check_code=check_code, timeout=4.0)
+        if not reply or reply.get("code") != 0:
+            code_val = reply.get("code") if isinstance(reply, dict) else "unreachable"
+            msg = reply.get("message") if isinstance(reply, dict) else "timeout/connection refused"
+            print(
+                f"Error: Printer HTTP verification failed at {printer_ip}:8898 (code={code_val}, msg={msg}).\n"
+                "Re-check IP, Serial Number, and CheckCode (or pass --force to save anyway).",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Verified printer {serial} at {printer_ip}:8898 (code=0).")
+
+    printers_map = doc.get("printers")
+    if not isinstance(printers_map, dict):
+        printers_map = {}
+
+    existing_entry = dict(printers_map.get(serial) or saved or {})
+    updated_entry = {
+        "Name": existing_entry.get("Name") or serial,
+        "IPAddress": printer_ip,
+        "SerialNumber": serial,
+        "CheckCode": check_code,
+        "ClientType": existing_entry.get("ClientType") or "new",
+        "printerModel": existing_entry.get("printerModel") or "Flashforge Adventurer 5M Pro",
+        "modelType": existing_entry.get("modelType") or "adventurer-5m-pro",
+        "commandPort": int((matched or {}).get("commandPort") or existing_entry.get("commandPort") or 8899),
+        "httpPort": int((matched or {}).get("eventPort") or existing_entry.get("httpPort") or 8898),
+        "customCameraEnabled": bool(existing_entry.get("customCameraEnabled", False)),
+        "customCameraUrl": existing_entry.get("customCameraUrl") or "",
+        "customLedsEnabled": bool(existing_entry.get("customLedsEnabled", False)),
+        "forceLegacyMode": bool(existing_entry.get("forceLegacyMode", False)),
+        "webUIEnabled": bool(existing_entry.get("webUIEnabled", True)),
+        "lastConnected": existing_entry.get("lastConnected") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if "activeSpoolData" in existing_entry:
+        updated_entry["activeSpoolData"] = existing_entry["activeSpoolData"]
+
+    printers_map[serial] = updated_entry
+    doc["lastUsedPrinterSerial"] = serial
+    doc["printers"] = printers_map
+
+    save_printer_details_atomic(ident["data_dir"], doc, ident["uid"], ident["gid"])
+    print(f"Updated {ident['data_dir']}/printer_details.json")
+
+    sync_ns = argparse.Namespace(iptables_only=False)
+    cmd_sync(sync_ns)
+
+    print("Restarting flashforgeui.service...")
+    subprocess.run(["systemctl", "restart", "flashforgeui.service"], check=True)
+
+    connected_ok = False
+    for _ in range(10):
+        code, body = _http_get_json(f"http://127.0.0.1:{ident['webui_port']}/api/printer/status", timeout=2.0)
+        if code == 200 and isinstance(body, dict) and body.get("success"):
+            connected_ok = True
+            break
+        time.sleep(1.0)
+
+    print("")
+    cmd_status(argparse.Namespace())
+    print("\nReminder: If the server's LAN IP changed on this network, update the server URL in your")
+    print("FlashForgeUI Android app (or connect via your Tailscale IP if configured).")
+    return 0 if connected_ok else 1
+
+
+def _find_portable_assets_dir() -> Path:
+    script_dir = Path(__file__).resolve().parent
+    candidates = [script_dir, Path("/opt/flashforge-stack")]
+    for candidate in candidates:
+        if (candidate / "install.sh").is_file() and (candidate / "systemd").is_dir():
+            return candidate
+    raise FileNotFoundError("Could not locate portable templates directory (/opt/flashforge-stack or repo deploy/portable)")
+
+
+def cmd_export_portable(args: argparse.Namespace) -> int:
+    ident = resolve_stack_identity()
+    assets_dir = _find_portable_assets_dir()
+
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    out_path = os.path.abspath(
+        args.output or f"./flashforge-portable-{socket.gethostname()}-{stamp}.tar.gz"
+    )
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="ff-export-") as tmp:
+        bundle_dir = Path(tmp) / "flashforge-portable"
+        portable_dst = bundle_dir / "deploy" / "portable"
+        (portable_dst / "systemd").mkdir(parents=True, exist_ok=True)
+
+        for fname in ("install.sh", "README.md"):
+            src = assets_dir / fname
+            if src.is_file():
+                shutil.copy2(src, portable_dst / fname)
+        shutil.copy2(Path(__file__).resolve(), portable_dst / "flashforge-stack")
+        os.chmod(portable_dst / "install.sh", 0o755)
+        os.chmod(portable_dst / "flashforge-stack", 0o755)
+        for tmpl in (assets_dir / "systemd").glob("*.in"):
+            shutil.copy2(tmpl, portable_dst / "systemd" / tmpl.name)
+
+        ff_cfg_src = Path(ident["data_dir"])
+        ff_cfg_dst = bundle_dir / "configs" / "FlashForgeUI"
+        ff_cfg_dst.mkdir(parents=True, exist_ok=True)
+        for fname in ("config.json", "printer_details.json"):
+            src = ff_cfg_src / fname
+            if src.is_file():
+                shutil.copy2(src, ff_cfg_dst / fname)
+        cal_src = ff_cfg_src / "calibration"
+        if cal_src.is_dir() and any(cal_src.iterdir()):
+            shutil.copytree(cal_src, ff_cfg_dst / "calibration")
+
+        pg_state_src = Path(ident["printguard_data_dir"]) / "state.json"
+        if pg_state_src.is_file():
+            pg_cfg_dst = bundle_dir / "configs" / "printguard"
+            pg_cfg_dst.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(pg_state_src, pg_cfg_dst / "state.json")
+
+        sp_dst = bundle_dir / "configs" / "simplyprint"
+        sp_db = Path(ident["simplyprint_db"])
+        if sp_db.is_file():
+            try:
+                sp_dst.mkdir(parents=True, exist_ok=True)
+                src_conn = sqlite3.connect(f"file:{sp_db}?mode=ro", uri=True)
+                dst_conn = sqlite3.connect(sp_dst / "state.db")
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+                    src_conn.close()
+                for extra_src, name in (
+                    (Path("/root/.local/share/SimplyPrint/instance"), "instance"),
+                    (Path("/root/.config/SimplyPrint/runtime.json"), "runtime.json"),
+                ):
+                    if extra_src.is_file():
+                        shutil.copy2(extra_src, sp_dst / name)
+            except (OSError, sqlite3.Error) as exc:
+                print(
+                    f"[export] Warning: could not read SimplyPrint state ({exc}); run with sudo to include it.",
+                    file=sys.stderr,
+                )
+
+        if not args.config_only:
+            bin_src = Path("/usr/local/bin/flashforge-webui")
+            if bin_src.is_file():
+                (bundle_dir / "binaries").mkdir(parents=True, exist_ok=True)
+                shutil.copy2(bin_src, bundle_dir / "binaries" / "flashforge-webui")
+
+            pg_dir = Path("/opt/printguard")
+            if pg_dir.is_dir():
+                shutil.copytree(
+                    pg_dir,
+                    bundle_dir / "opt" / "printguard",
+                    symlinks=True,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                )
+
+        manifest = {
+            "source_hostname": socket.gethostname(),
+            "exported_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "config_only": bool(args.config_only),
+            "stack_user": ident["user"],
+            "ports": {
+                "webui": ident["webui_port"],
+                "simplyprint": ident["simplyprint_port"],
+                "printguard": ident["printguard_port"],
+            },
+        }
+        (bundle_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        tmp_tar = f"{out_path}.tmp"
+        with tarfile.open(tmp_tar, "w:gz") as tar:
+            tar.add(bundle_dir, arcname="flashforge-portable")
+        os.replace(tmp_tar, out_path)
+
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    print(f"Created portable archive: {out_path} ({size_mb:.2f} MiB)")
+    print("To restore on a new Linux x86_64 host:")
+    print(f"  tar -xzf {os.path.basename(out_path)}")
+    print("  cd flashforge-portable && sudo ./deploy/portable/install.sh")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="flashforge-stack",
+        description="Portable management, LAN discovery, sync, and migration tool for FlashForgeWebUI.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_disc = sub.add_parser("discover", help="Discover FlashForge printers on the local LAN.")
+    p_disc.add_argument("--json", action="store_true", help="Output discovered printers as JSON.")
+    p_disc.add_argument(
+        "--tcp-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Probe local /24 port 8898 if UDP multicast/broadcast yields 0 printers.",
+    )
+    p_disc.set_defaults(func=cmd_discover)
+
+    p_stat = sub.add_parser("status", help="Show service health, URLs, printer state, and sync status.")
+    p_stat.set_defaults(func=cmd_status)
+
+    p_sync = sub.add_parser("sync", help="Sync iptables NAT redirect and SimplyPrint state.db to printer_details.json.")
+    p_sync.add_argument(
+        "--iptables-only",
+        action="store_true",
+        help="Only reconcile the iptables NAT 8080->3000 redirect rule (used by flashforgeui ExecStartPost).",
+    )
+    p_sync.set_defaults(func=cmd_sync)
+
+    p_setup = sub.add_parser("setup", help="Interactively reconfigure printer IP, Serial, CheckCode, and sync.")
+    p_setup.add_argument("--printer-ip", help="Printer LAN IPv4 address.")
+    p_setup.add_argument("--serial", help="Printer serial number.")
+    p_setup.add_argument("--check-code", help="Printer LAN Access Code / CheckCode.")
+    p_setup.add_argument("--yes", action="store_true", help="Accept discovered/default values non-interactively.")
+    p_setup.add_argument("--force", action="store_true", help="Save configuration even if HTTP /detail check fails.")
+    p_setup.set_defaults(func=cmd_setup)
+
+    p_exp = sub.add_parser("export-portable", help="Package configs and binaries into a portable tar.gz migration bundle.")
+    p_exp.add_argument("output", nargs="?", help="Output .tar.gz file path.")
+    p_exp.add_argument("--config-only", action="store_true", help="Export only configs, unit templates, and scripts (omit binaries).")
+    p_exp.set_defaults(func=cmd_export_portable)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

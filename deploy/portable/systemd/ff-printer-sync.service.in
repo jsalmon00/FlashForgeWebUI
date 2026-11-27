@@ -1,0 +1,13 @@
+[Unit]
+Description=Sync FlashForge printer IP across iptables and SimplyPrint
+After=network-online.target flashforgeui.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment="STACK_USER=__STACK_USER__"
+Environment="DATA_DIR=__DATA_DIR__"
+ExecStart=/usr/local/bin/flashforge-stack sync
+
+[Install]
+WantedBy=multi-user.target

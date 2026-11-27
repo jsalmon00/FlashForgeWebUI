@@ -1,0 +1,24 @@
+[Unit]
+Description=FlashForgeWebUI Standalone Server
+Documentation=https://github.com/jsalmon00/FlashForgeWebUI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__STACK_USER__
+Group=__STACK_GROUP__
+WorkingDirectory=__STACK_HOME__
+Environment="HOME=__STACK_HOME__"
+Environment="DATA_DIR=__DATA_DIR__"
+Environment="NODE_ENV=production"
+ExecStart=/usr/local/bin/flashforge-webui --last-used
+ExecStartPost=+/usr/local/bin/flashforge-stack sync --iptables-only
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=15
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
